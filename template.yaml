@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Event-driven order management system (MVP)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 10
+    MemorySize: 256
+    Architectures:
+      - x86_64
+
+Resources:
+  # -------------------------
+  # DynamoDB Tables
+  # -------------------------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: OrdersTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+
+  # -------------------------
+  # SQS Queues (one per step) + DLQs
+  # -------------------------
+  OrderCreatedDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderCreatedDLQ
+
+  OrderCreatedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderCreatedQueue
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderCreatedDLQ.Arn
+        maxReceiveCount: 3
+
+  InventoryReservedDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: InventoryReservedDLQ
+
+  InventoryReservedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: InventoryReservedQueue
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InventoryReservedDLQ.Arn
+        maxReceiveCount: 3
+
+  PaymentSuccessDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: PaymentSuccessDLQ
+
+  PaymentSuccessQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: PaymentSuccessQueue
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PaymentSuccessDLQ.Arn
+        maxReceiveCount: 3
+
+
+  # -------------------------
+  # Lambda: Order API
+  # -------------------------
+  OrderApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/order_api/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ORDER_EVENTS_QUEUE_URL: !Ref OrderCreatedQueue
+          SERVICE_NAME: order_api
+          LOG_LEVEL: INFO
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrderCreatedQueue.QueueName
+      Events:
+        HealthApi:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: GET
+        CreateOrderApi:
+          Type: Api
+          Properties:
+            Path: /orders
+            Method: POST
+        GetOrderApi:
+          Type: Api
+          Properties:
+            Path: /orders/{order_id}
+            Method: GET
+
+  # -------------------------
+  # Workers (still simple stubs for now)
+  # -------------------------
+  InventoryWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/inventory_worker/
+      Handler: handler.lambda_handler
+      Events:
+        OrderCreatedEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderCreatedQueue.Arn
+            BatchSize: 1
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ORDER_EVENTS_QUEUE_URL: !Ref InventoryReservedQueue
+          SERVICE_NAME: inventory_worker
+          LOG_LEVEL: INFO
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt InventoryReservedQueue.QueueName
+
+
+
+  PaymentWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/payment_worker/
+      Handler: handler.lambda_handler
+      Events:
+        InventoryReservedEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InventoryReservedQueue.Arn
+            BatchSize: 1
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ORDER_EVENTS_QUEUE_URL: !Ref PaymentSuccessQueue
+          PAYMENT_FAILURE_RATE: "0.3"
+          SERVICE_NAME: payment_worker
+          LOG_LEVEL: INFO
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PaymentSuccessQueue.QueueName
+
+
+
+  NotificationWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/notification_worker/
+      Handler: handler.lambda_handler
+      Events:
+        PaymentSuccessEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PaymentSuccessQueue.Arn
+            BatchSize: 1
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          SERVICE_NAME: notification_worker
+          LOG_LEVEL: INFO
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+
+
+  PaymentFailureDlqHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/payment_failure_dlq/
+      Handler: handler.lambda_handler
+      Events:
+        InventoryReservedDLQEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InventoryReservedDLQ.Arn
+            BatchSize: 1
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          SERVICE_NAME: payment_dlq
+          LOG_LEVEL: INFO
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+
+
+Outputs:
+  ApiBaseUrl:
+    Description: API Gateway base URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  OrdersTableName:
+    Description: Orders DynamoDB table name
+    Value: !Ref OrdersTable
+  OrderCreatedQueueUrl:
+    Value: !Ref OrderCreatedQueue
+
